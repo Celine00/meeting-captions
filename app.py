@@ -11,13 +11,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import sounddevice as sd
 
+# Core libraries (fast imports)
 import numpy as np
 import requests
 import certifi
 import sounddevice as sd
 from dotenv import load_dotenv
+
+# Heavy imports - imported at module level for better error messages
+# but actual model loading is deferred
 from faster_whisper import WhisperModel
 from jinja2 import Template
 from markdown import markdown
@@ -239,14 +242,15 @@ class Broadcaster:
 class SegmentRec:
     t0: float
     t1: float
-    text: str
+    text: str  # Original transcription (usually English)
+    text_zh: Optional[str] = None  # Chinese translation (if enabled)
     avg_logprob: Optional[float] = None
 
 
 class TranscriptWriter:
     def __init__(self, run_dir: Path):
         self.jsonl_path = run_dir / "transcript.jsonl"
-        self.md_path = run_dir / "transcript.md"
+        self.run_dir = run_dir
         self._jsonl = self.jsonl_path.open("a", encoding="utf-8")
 
     def append(self, seg: SegmentRec) -> None:
@@ -256,16 +260,28 @@ class TranscriptWriter:
     def close(self) -> None:
         self._jsonl.close()
 
-    def render_markdown(self) -> str:
+    def render_markdown(self, lang: str = "en") -> str:
+        """Render transcript as markdown in specified language"""
         lines = []
         for line in self.jsonl_path.read_text(encoding="utf-8").splitlines():
             obj = json.loads(line)
             t0 = obj["t0"]
-            text = obj["text"].strip()
+
+            # Choose text based on language
+            if lang == "zh" and "text_zh" in obj and obj["text_zh"]:
+                text = obj["text_zh"].strip()
+            else:
+                text = obj["text"].strip()
+
             mmss = f"{int(t0//60):02d}:{int(t0%60):02d}"
             lines.append(f"- **{mmss}** {text}")
-        md = "# Transcript\n\n" + "\n".join(lines) + "\n"
-        self.md_path.write_text(md, encoding="utf-8")
+
+        title = "# 会议记录\n\n" if lang == "zh" else "# Transcript\n\n"
+        md = title + "\n".join(lines) + "\n"
+
+        # Save to appropriate file
+        md_file = self.run_dir / f"transcript-{lang}.md"
+        md_file.write_text(md, encoding="utf-8")
         return md
 
 
@@ -301,6 +317,28 @@ def doubao_chat(messages: List[Dict[str, str]], model: str, timeout: int = 90) -
         raise RuntimeError(error_msg) from e
 
 
+async def translate_to_chinese_async(text: str, model: str) -> str:
+    """Translate English text to Chinese using Doubao LLM"""
+    try:
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a professional translator. Translate the following text to Simplified Chinese. Return ONLY the translation, no explanations or additional text."
+            },
+            {"role": "user", "content": text}
+        ]
+        # Use asyncio to run synchronous doubao_chat in executor
+        loop = asyncio.get_event_loop()
+        translation = await loop.run_in_executor(
+            None,
+            lambda: doubao_chat(messages, model=model, timeout=30)
+        )
+        return translation.strip()
+    except Exception as e:
+        print(f"[TRANSLATE] Warning: Translation failed: {e}")
+        return text  # Fallback to original text
+
+
 def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     # 简单按字符切；更精细可按段落/句子
     text = text.strip()
@@ -318,16 +356,38 @@ def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
         start = cut
     return [c for c in chunks if c]
 
-def summarize_transcript(transcript_md: str, model: str) -> str:
+def summarize_transcript(transcript_md: str, model: str, lang: str = "en") -> str:
+    """Generate meeting summary in specified language"""
     chunks = chunk_text(transcript_md, max_chars=12000)
 
-    partials = []
-    for i, ch in enumerate(chunks, 1):
-        msg = [
-            {"role": "system", "content": "You write concise, actionable meeting minutes in English."},
-            {
-                "role": "user",
-                "content": f"""Summarize this meeting transcript chunk ({i}/{len(chunks)}).
+    # Language-specific system prompts and instructions
+    if lang == "zh":
+        system_prompt = "你是一个专业的会议纪要撰写助手。请用简体中文撰写简洁、可操作的会议纪要。"
+        summary_instruction = """请总结这段会议记录（第{}/{}段）。
+
+使用Markdown格式返回：
+- 关键要点（项目符号列表）
+- 决策事项（项目符号列表）
+- 行动项（项目符号列表，如有提及请包含负责人）
+
+会议记录：
+{}
+"""
+        consolidate_system = "你负责将多个部分总结合并去重，生成最终的会议纪要。"
+        consolidate_instruction = """请将以下部分总结合并去重，生成最终的会议纪要。
+
+使用Markdown格式，包含以下章节：
+1) 核心要点（3-5个要点）
+2) 决策事项
+3) 行动项（表格：负责人 | 截止日期 | 任务）
+4) 待解决问题 / 风险
+
+部分总结：
+{}
+"""
+    else:  # English
+        system_prompt = "You write concise, actionable meeting minutes in English."
+        summary_instruction = """Summarize this meeting transcript chunk ({}/{}).
 
 Return Markdown with:
 - Key points (bullets)
@@ -335,8 +395,28 @@ Return Markdown with:
 - Action items (bullets, include owner if mentioned)
 
 Chunk:
-{ch}
-""",
+{}
+"""
+        consolidate_system = "You consolidate meeting minutes into a final coherent set of notes."
+        consolidate_instruction = """Merge and deduplicate these partial summaries into final meeting notes.
+
+Output Markdown with sections:
+1) TL;DR (3-5 bullets)
+2) Decisions
+3) Action Items (table: Owner | Due | Task)
+4) Open Questions / Risks
+
+Partials:
+{}
+"""
+
+    partials = []
+    for i, ch in enumerate(chunks, 1):
+        msg = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": summary_instruction.format(i, len(chunks), ch),
             },
         ]
         partials.append(doubao_chat(msg, model=model))
@@ -347,20 +427,10 @@ Chunk:
         partials_md = os.linesep.join(["---" + os.linesep + p for p in partials])
 
         msg = [
-            {"role": "system", "content": "You consolidate meeting minutes into a final coherent set of notes."},
+            {"role": "system", "content": consolidate_system},
             {
                 "role": "user",
-                "content": f"""Merge and deduplicate these partial summaries into final meeting notes.
-
-Output Markdown with sections:
-1) TL;DR (3-5 bullets)
-2) Decisions
-3) Action Items (table: Owner | Due | Task)
-4) Open Questions / Risks
-
-Partials:
-{partials_md}
-""",
+                "content": consolidate_instruction.format(partials_md),
             },
         ]
         combined = doubao_chat(msg, model=model)
@@ -369,15 +439,15 @@ Partials:
 
 
 REPORT_TEMPLATE = Template("""<!DOCTYPE html>
-<html lang="en">
+<html lang="{{ lang_code }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Meeting Report - {{ started_at }}</title>
+    <title>{{ title }} - {{ started_at }}</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, 'PingFang SC', 'Microsoft YaHei', sans-serif;
             line-height: 1.6;
             color: #333;
             background: #f5f5f5;
@@ -431,20 +501,20 @@ REPORT_TEMPLATE = Template("""<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <h1>📝 Meeting Report</h1>
+        <h1>{{ title }}</h1>
         <div class="meta">
-            <strong>Date:</strong> {{ started_at }}<br>
-            <strong>Audio Device:</strong> {{ device }}<br>
-            <strong>Whisper Model:</strong> {{ whisper_model }}
+            <strong>{{ date_label }}:</strong> {{ started_at }}<br>
+            <strong>{{ device_label }}:</strong> {{ device }}<br>
+            <strong>{{ model_label }}:</strong> {{ whisper_model }}
         </div>
 
         <div class="summary">
-            <h2>📊 Summary</h2>
+            <h2>{{ summary_title }}</h2>
             {{ summary_html|safe }}
         </div>
 
         <div class="transcript">
-            <h2>📜 Transcript</h2>
+            <h2>{{ transcript_title }}</h2>
             {{ transcript_html|safe }}
         </div>
     </div>
@@ -453,18 +523,45 @@ REPORT_TEMPLATE = Template("""<!DOCTYPE html>
 """)
 
 
-def build_report(run_dir: Path, meta: Dict[str, Any], summary_md: str, transcript_md: str) -> Path:
+def build_report(run_dir: Path, meta: Dict[str, Any], summary_md: str, transcript_md: str, lang: str = "en") -> Path:
+    """Build HTML report in specified language"""
     summary_html = markdown(summary_md, extensions=["tables", "fenced_code"])
     transcript_html = markdown(transcript_md, extensions=["tables", "fenced_code"])
 
+    # Language-specific labels
+    if lang == "zh":
+        title = "📝 会议报告"
+        date_label = "日期"
+        device_label = "音频设备"
+        model_label = "Whisper模型"
+        summary_title = "📊 会议总结"
+        transcript_title = "📜 会议记录"
+        lang_code = "zh-CN"
+    else:
+        title = "📝 Meeting Report"
+        date_label = "Date"
+        device_label = "Audio Device"
+        model_label = "Whisper Model"
+        summary_title = "📊 Summary"
+        transcript_title = "📜 Transcript"
+        lang_code = "en"
+
     html = REPORT_TEMPLATE.render(
+        title=title,
+        lang_code=lang_code,
+        date_label=date_label,
+        device_label=device_label,
+        model_label=model_label,
+        summary_title=summary_title,
+        transcript_title=transcript_title,
         started_at=meta.get("started_at", ""),
         device=meta.get("audio_device_name", "Unknown"),
         whisper_model=meta.get("whisper_model", ""),
         summary_html=summary_html,
         transcript_html=transcript_html,
     )
-    out = run_dir / "report.html"
+
+    out = run_dir / f"report-{lang}.html"
     out.write_text(html, encoding="utf-8")
     return out
 
@@ -486,6 +583,7 @@ async def run_capture(
     doubao_model: str,
     save_wav: bool,
     no_summary: bool = False,
+    caption_lang: str = "en",
     stop_event: asyncio.Event = None,
 ):
     run_dir = make_run_dir(out_root)
@@ -503,11 +601,9 @@ async def run_capture(
         "step_s": step_s,
         "ws_port": ws_port,
         "doubao_model": doubao_model,
+        "caption_lang": caption_lang,
     }
     write_json(run_dir / "meta.json", meta)
-
-    # Whisper (M1 Pro: CPU + int8 usually best for speed/mem)
-    model = WhisperModel(whisper_model_name, device="cpu", compute_type=compute_type)
 
     # Ring buffer holds last window + some slack
     capacity = int(sr * max(window_s * 2, 20))
@@ -534,13 +630,12 @@ async def run_capture(
     # Dedupe state: last emitted absolute end time
     last_emitted_t1 = 0.0
 
-    print(f"[RUN] {run_dir}")
+    print(f"\n[RUN] {run_dir}")
     print(f"[AUDIO] input={device_index} | {device_name} | sr={sr} | ch={channels}")
     print(f"[WS]  ws://127.0.0.1:{ws_port}")
     print(f"[WAV] save_wav={save_wav}")
-    print("Press Ctrl+C to stop.\n")
 
-    # Start audio stream
+    # Start audio stream IMMEDIATELY
     stream = sd.InputStream(
         device=device_index,
         samplerate=sr,
@@ -550,11 +645,40 @@ async def run_capture(
         blocksize=0,
     )
 
+    print(f"\n[AUDIO] Capturing started")
+    print(f"[MODEL] Loading Whisper '{whisper_model_name}' in background...")
+
+    # Load Whisper model in parallel with audio capture
+    # This async task runs while we're buffering audio
+    loop = asyncio.get_event_loop()
+    model_future = loop.run_in_executor(
+        None,
+        lambda: WhisperModel(whisper_model_name, device="cpu", compute_type=compute_type)
+    )
+
+    print("\n[READY] Press Ctrl+C to stop.\n")
+
     try:
         with stream:
+            # Wait for model to load (with progress updates)
+            model = None
+            model_loaded = False
+
             try:
                 while not (stop_event and stop_event.is_set()):
                     await asyncio.sleep(step_s)
+
+                    # Check if model is ready (non-blocking)
+                    if not model_loaded:
+                        if model_future.done():
+                            model = await model_future
+                            print(f"[MODEL] Whisper model loaded and ready")
+                            model_loaded = True
+                        else:
+                            # Still loading, show buffering status
+                            buffered_s = ring.seconds_written(sr)
+                            print(f"[MODEL] Loading... (buffered {buffered_s:.1f}s of audio)")
+                            continue
 
                     audio = ring.get_last(int(sr * window_s))  # (n, ch)
                     if audio.shape[0] < int(sr * min(2.0, window_s)):
@@ -595,21 +719,36 @@ async def run_capture(
                             continue
 
                         last_emitted_t1 = max(last_emitted_t1, abs_t1)
+
+                        # Create segment record
                         rec = SegmentRec(
                             t0=abs_t0,
                             t1=abs_t1,
                             text=text,
                             avg_logprob=getattr(seg, "avg_logprob", None),
                         )
+
+                        # Translate to Chinese if needed
+                        if caption_lang == "zh":
+                            rec.text_zh = await translate_to_chinese_async(rec.text, doubao_model)
+
+                        # Save to JSONL
                         tw.append(rec)
 
-                        await broadcaster.queue.put(
-                            {"type": "caption", "t0": rec.t0, "t1": rec.t1, "text": rec.text}
-                        )
+                        # Broadcast via WebSocket
+                        await broadcaster.queue.put({
+                            "type": "caption",
+                            "t0": rec.t0,
+                            "t1": rec.t1,
+                            "text": rec.text,
+                            "text_zh": rec.text_zh,
+                            "display_lang": caption_lang
+                        })
 
-                        # Console view (optional)
+                        # Console output - show language based on setting
                         mmss = f"{int(rec.t0//60):02d}:{int(rec.t0%60):02d}"
-                        print(f"[{mmss}] {rec.text}")
+                        display_text = rec.text_zh if (caption_lang == "zh" and rec.text_zh) else rec.text
+                        print(f"[{mmss}] {display_text}")
                         new_count += 1
 
                     if new_count == 0:
@@ -659,34 +798,56 @@ async def run_capture(
             else:
                 print("[WAV] Warning: --save-wav enabled but no audio frames were captured")
 
-        # Render transcript.md
-        transcript_md = tw.render_markdown()
+        # Render transcripts
+        print("[TRANSCRIPT] Rendering markdown...")
+        transcript_en = tw.render_markdown(lang="en")
 
-        # Summarize via Doubao
-        summary_md = ""
+        # Generate Chinese transcript only if translations exist
+        transcript_zh = None
+        if caption_lang == "zh":
+            transcript_zh = tw.render_markdown(lang="zh")
+
+        print("[TRANSCRIPT] Transcript files saved")
+
+        # Generate summaries in both languages (unless --no-summary)
+        summary_en = ""
+        summary_zh = ""
+
         if no_summary:
             print("[SUM] Skipping summary (--no-summary flag)")
-            summary_md = "# Summary\n\n*Summary generation skipped.*\n"
+            summary_en = "# Summary\n\n*Summary generation skipped.*\n"
+            summary_zh = "# 总结\n\n*已跳过总结生成。*\n"
         else:
             try:
-                print("[SUM] Calling Doubao LLM...")
-                summary_md = summarize_transcript(transcript_md, model=doubao_model)
-                (run_dir / "summary.md").write_text(summary_md, encoding="utf-8")
-                print("[SUM] Summary saved")
-            except Exception as e:
-                print(f"[SUM] Warning: Failed to generate summary: {e}")
-                summary_md = "# Summary\n\n*Summary generation failed. See transcript below.*\n"
-                (run_dir / "summary.md").write_text(f"Error: {e}\n", encoding="utf-8")
+                print("[SUM] Generating English summary...")
+                summary_en = summarize_transcript(transcript_en, model=doubao_model, lang="en")
+                (run_dir / "summary-en.md").write_text(summary_en, encoding="utf-8")
+                print("[SUM] English summary saved")
 
-        # Build report.html
+                print("[SUM] Generating Chinese summary...")
+                summary_zh = summarize_transcript(transcript_en, model=doubao_model, lang="zh")
+                (run_dir / "summary-zh.md").write_text(summary_zh, encoding="utf-8")
+                print("[SUM] Chinese summary saved")
+            except Exception as e:
+                print(f"[SUM] Warning: Failed to generate summaries: {e}")
+                summary_en = "# Summary\n\n*Summary generation failed.*\n"
+                summary_zh = "# 总结\n\n*总结生成失败。*\n"
+                (run_dir / "summary-en.md").write_text(f"Error: {e}\n", encoding="utf-8")
+                (run_dir / "summary-zh.md").write_text(f"Error: {e}\n", encoding="utf-8")
+
+        # Build HTML reports
         try:
-            report_path = build_report(run_dir, meta, summary_md, transcript_md)
-            print(f"[DONE] report: {report_path}")
-            print("Tip: open it with:")
-            print(f"open '{report_path}'")
+            print("[REPORT] Building HTML reports...")
+            report_en = build_report(run_dir, meta, summary_en, transcript_en, lang="en")
+            report_zh = build_report(run_dir, meta, summary_zh, transcript_zh or transcript_en, lang="zh")
+            print(f"[DONE] English report: {report_en}")
+            print(f"[DONE] Chinese report: {report_zh}")
+            print("Tip: open them with:")
+            print(f"open '{report_en}'")
+            print(f"open '{report_zh}'")
         except Exception as e:
             print(f"[DONE] Report generation failed: {e}")
-            print(f"[DONE] Transcript saved to: {run_dir / 'transcript.md'}")
+            print(f"[DONE] Transcripts saved to: {run_dir}")
 
 
 def main():
@@ -695,7 +856,7 @@ def main():
     p.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
     p.add_argument("--sr", type=int, default=0, help="Capture sample rate. 0 = use device default")
     p.add_argument("--channels", type=int, default=2, help="BlackHole usually 2ch")
-    p.add_argument("--whisper-model", type=str, default="small")
+    p.add_argument("--whisper-model", type=str, default="base", help="Whisper model: tiny, base, small, medium, large (default: base for faster startup)")
     p.add_argument("--compute-type", type=str, default="int8", help="M1 Pro CPU recommended: int8")
     p.add_argument("--window-s", type=float, default=8.0)
     p.add_argument("--step-s", type=float, default=1.0)
@@ -708,22 +869,41 @@ def main():
     p.add_argument("--doubao-model", type=str, default=DEFAULT_DOUBAO_MODEL)
     p.add_argument("--no-summary", action="store_true", help="skip LLM summary generation")
     p.add_argument("--save-wav", action="store_true", help="save audio.wav for debugging")
+    p.add_argument(
+        "--caption-lang",
+        type=str,
+        choices=["en", "zh"],
+        default="en",
+        help="Caption display language: en=English (default), zh=Chinese (translates in real-time)"
+    )
     args = p.parse_args()
 
     if args.list_devices:
         list_audio_devices()
         return
 
+    # Provide immediate feedback
+    print("\n" + "="*60)
+    print("  MeetingCaptions - Real-time Transcription System")
+    print("="*60)
+    print(f"\n[CONFIG] Whisper model: {args.whisper_model}")
+    print(f"[CONFIG] Doubao model: {args.doubao_model}")
+    print(f"[CONFIG] Caption language: {args.caption_lang}")
+    print(f"[CONFIG] Summary: {'disabled' if args.no_summary else 'enabled'}")
+
+    print("\n[INIT] Resolving audio device...")
     # Resolve input device robustly (indexes can change when plugging/unplugging headsets)
     device_index, device_name, channels, device_default_sr = resolve_input_device(
         args.device, prefer_channels=args.channels
     )
+    print(f"[INIT] Audio device: {device_name} (index={device_index})")
 
     # Auto SR: use device default unless user overrides
     sr = int(args.sr) if int(args.sr) > 0 else int(device_default_sr)
 
     out_root = Path(args.out_root).expanduser()
     out_root.mkdir(parents=True, exist_ok=True)
+    print(f"[INIT] Output directory: {out_root}")
 
     # Create event loop to handle signals properly
     loop = asyncio.new_event_loop()
@@ -755,6 +935,7 @@ def main():
                 doubao_model=args.doubao_model,
                 save_wav=args.save_wav,
                 no_summary=args.no_summary,
+                caption_lang=args.caption_lang,
                 stop_event=stop_event,
             )
         )
