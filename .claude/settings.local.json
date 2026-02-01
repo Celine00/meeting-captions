@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(ls:*)",
+      "Bash(xargs ls:*)",
+      "Bash(test:*)",
+      "Bash(source ~/.pyenv/versions/meeting-captions/bin/activate)",
+      "Bash(pip install:*)",
+      "Bash(python app.py:*)",
+      "Bash(python -c:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(git init:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInit MeetingCaptions\n\nReal-time meeting transcription system using Faster-Whisper and Doubao LLM.\n\nFeatures:\n- Real-time audio capture and transcription with WebSocket streaming\n- Support for BlackHole virtual audio device\n- Sliding window approach with deduplication\n- LLM-based meeting summarization using Doubao API\n- HTML report generation with transcript and summary\n- Flexible CLI with environment variable configuration\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")"
+    ]
+  }
+}
