@@ -22,18 +22,33 @@ cp .env.example .env
 # Edit .env and add your DOUBAO_API_KEY
 ```
 
+### Performance Utilities
+
+```bash
+# Benchmark model loading times to choose the right model
+python3 benchmark_models.py
+
+# Pre-download models to avoid first-run delay
+python3 preload_model.py base    # Pre-load base model
+python3 preload_model.py tiny    # Pre-load tiny model
+python3 preload_model.py small   # Pre-load small model
+```
+
 ### Running the Application
 
 ```bash
-# Basic usage with BlackHole device
+# Basic usage with BlackHole device (English captions)
 python3 app.py --device blackhole
+
+# Chinese captions with real-time translation
+python3 app.py --device blackhole --caption-lang zh
 
 # List available audio devices
 python3 app.py --list-devices
 # Or use the helper script
 python3 list_devices.py
 
-# Full configuration example
+# Full configuration example with bilingual support
 python3 app.py \
   --device blackhole \
   --sr 48000 \
@@ -44,7 +59,11 @@ python3 app.py \
   --step-s 1.0 \
   --ws-port 8765 \
   --doubao-model doubao-pro-32k-240615 \
+  --caption-lang zh \
   --save-wav
+
+# Skip summary generation
+python3 app.py --device blackhole --no-summary
 ```
 
 ### Environment Setup
@@ -87,9 +106,33 @@ Core dependencies (see `requirements.txt`):
 1. **Real-time**: WebSocket broadcasts (`ws://127.0.0.1:8765`) for live caption display
 2. **Storage**: JSONL transcript log (`transcript.jsonl`) with structured segment records
 3. **Post-processing** (on Ctrl+C):
-   - Renders `transcript.md` with `MM:SS` timestamps
+   - Renders bilingual transcripts with `MM:SS` timestamps
    - Chunked summarization via Doubao (handles long transcripts by splitting at ~12k chars)
    - HTML report generation combining transcript + summary
+
+### Bilingual Support
+
+The system supports comprehensive bilingual capabilities:
+
+**Caption Translation** (via `--caption-lang` flag):
+- `--caption-lang en` (default): English captions only
+- `--caption-lang zh`: Real-time Chinese translation of English transcriptions
+  - Uses Doubao LLM to translate each caption segment (~200-500ms latency)
+  - Console and WebSocket show Chinese text
+  - JSONL stores both `text` (English) and `text_zh` (Chinese)
+
+**Summary Generation**:
+- Always generates both English and Chinese summaries (unless `--no-summary`)
+- Language-specific prompts ensure natural, contextually appropriate outputs
+- Each summary saved separately: `summary-en.md` and `summary-zh.md`
+
+**File Output**:
+- `transcript-en.md`: English transcript (always generated)
+- `transcript-zh.md`: Chinese transcript (only if `--caption-lang zh`)
+- `summary-en.md`: English meeting summary (always)
+- `summary-zh.md`: Chinese meeting summary (always)
+- `report-en.html`: English HTML report with English summary + transcript
+- `report-zh.html`: Chinese HTML report with Chinese summary + transcript
 
 ### File Structure
 
@@ -97,15 +140,54 @@ Core dependencies (see `requirements.txt`):
 records/
 └── YYYY-MM-DD/
     └── HH-MM-SS_zoom/
-        ├── meta.json          # Run configuration
-        ├── transcript.jsonl   # Raw segment records
-        ├── transcript.md      # Human-readable transcript
-        ├── summary.md         # LLM-generated meeting notes
-        ├── report.html        # Combined HTML report
-        └── audio.wav          # Optional raw audio (--save-wav)
+        ├── meta.json             # Run configuration (includes caption_lang)
+        ├── transcript.jsonl      # Raw segment records (with text_zh if caption-lang=zh)
+        ├── transcript-en.md      # English transcript
+        ├── transcript-zh.md      # Chinese transcript (if caption-lang=zh)
+        ├── summary-en.md         # English meeting summary
+        ├── summary-zh.md         # Chinese meeting summary
+        ├── report-en.html        # English HTML report
+        ├── report-zh.html        # Chinese HTML report
+        └── audio.wav             # Optional raw audio (--save-wav)
 ```
 
 ## Key Implementation Details
+
+### Startup Performance
+
+The application uses **lazy initialization** for optimal startup time:
+
+**Startup sequence (~2-3 seconds to start capturing)**:
+1. Configuration display and validation (~1s)
+2. Audio device resolution (~0.5s)
+3. WebSocket server start (~0.5s)
+4. **Audio capture begins immediately** (~2s total)
+5. Whisper model loads in background (parallel with audio buffering)
+
+**Key optimizations**:
+- **Audio capture starts immediately** - no waiting for model load
+- **Parallel model loading** - Whisper loads while audio buffers
+- **Progress feedback** - shows buffering status during model load
+- **Default 'base' model** - faster than 'small' (~3-5s vs ~8-10s load time)
+- **First transcription timing**: By the time 8 seconds of audio is buffered, model is typically loaded
+
+**Model loading times** (background, doesn't block startup):
+
+*First-time download (includes internet download):*
+- `tiny`: ~8-10 seconds
+- `base`: ~20-25 seconds (default)
+- `small`: ~30-40 seconds
+
+*Cached model loading (typical performance):*
+- `tiny`: ~0.5-1 second
+- `base`: ~0.5-1 second (default, best balance)
+- `small`: ~1-2 seconds
+- `medium`: ~2-3 seconds
+- `large`: ~4-5 seconds
+
+**First-time use**: Models auto-download from Hugging Face on first use and are cached at `~/.cache/huggingface/hub/`. Subsequent runs load from cache (under 1 second for base model).
+
+**Performance tip**: After the first run, startup is extremely fast (~2-3s to capture, <1s model load = ~3-4s total to start transcribing).
 
 ### Device Selection Strategy
 
@@ -133,14 +215,21 @@ Critical for sliding window approach:
 
 ### Doubao Integration
 
-Summary generation uses a two-phase approach:
+**Real-time Translation**:
+- Async translation function `translate_to_chinese_async()` runs in executor to avoid blocking
+- System prompt: "Translate to Simplified Chinese, return ONLY translation"
+- 30-second timeout per segment
+- Graceful fallback to English on failure
+
+**Summary Generation**:
+Summary generation uses a two-phase approach with language-specific prompts:
 1. **Chunking**: Splits long transcripts (~12k char chunks) with newline-aware splitting
 2. **Partial Summaries**: Each chunk gets key points, decisions, action items
+   - English: "You write concise, actionable meeting minutes in English."
+   - Chinese: "你是一个专业的会议纪要撰写助手。请用简体中文撰写简洁、可操作的会议纪要。"
 3. **Consolidation**: If multiple chunks, a second pass merges into final format:
-   - TL;DR (3-5 bullets)
-   - Decisions
-   - Action Items (Owner | Due | Task table)
-   - Open Questions / Risks
+   - English: TL;DR (3-5 bullets), Decisions, Action Items (table), Open Questions/Risks
+   - Chinese: 核心要点, 决策事项, 行动项（表格）, 待解决问题/风险
 
 ### HTML Report Generation
 
