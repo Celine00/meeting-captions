@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import inspect
 import json
 import os
 import signal
@@ -145,6 +146,27 @@ def resample_audio(mono: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
     y = scipy_signal.resample_poly(mono, up, down).astype(np.float32)
     return y
 
+
+def to_mono_best_channel(audio: np.ndarray) -> Tuple[np.ndarray, int, np.ndarray]:
+    """
+    Convert (n, ch) audio to mono by selecting the channel with highest RMS.
+    This avoids destructive cancellation and preserves level when one channel is silent.
+    Returns: (mono, selected_channel_index, per_channel_rms)
+    """
+    if audio.ndim == 1:
+        mono = audio.astype(np.float32, copy=False)
+        return mono, 0, np.array([float(np.sqrt(np.mean(mono * mono)))], dtype=np.float32)
+
+    channels = int(audio.shape[1])
+    if channels <= 1:
+        mono = audio[:, 0].astype(np.float32, copy=False)
+        return mono, 0, np.array([float(np.sqrt(np.mean(mono * mono)))], dtype=np.float32)
+
+    ch_rms = np.sqrt(np.mean(audio * audio, axis=0)).astype(np.float32)
+    selected = int(np.argmax(ch_rms))
+    mono = audio[:, selected].astype(np.float32, copy=False)
+    return mono, selected, ch_rms
+
 # -----------------------------
 # Audio ring buffer
 # -----------------------------
@@ -200,6 +222,10 @@ class RingBuffer:
         with self.lock:
             return self.total_written / float(sr)
 
+    def available_samples(self) -> int:
+        with self.lock:
+            return self.capacity if self.filled else min(self.write_pos, self.capacity)
+
 
 # -----------------------------
 # WebSocket broadcaster
@@ -242,9 +268,10 @@ class Broadcaster:
 class SegmentRec:
     t0: float
     t1: float
-    text: str  # Original transcription (usually English)
-    text_zh: Optional[str] = None  # Chinese translation (if enabled)
+    text: str  # Transcribed text in detected language
     avg_logprob: Optional[float] = None
+    detected_language: Optional[str] = None      # Detected language code: "en", "zh", etc.
+    language_confidence: Optional[float] = None   # Confidence score: 0.0-1.0
 
 
 class TranscriptWriter:
@@ -260,27 +287,19 @@ class TranscriptWriter:
     def close(self) -> None:
         self._jsonl.close()
 
-    def render_markdown(self, lang: str = "en") -> str:
-        """Render transcript as markdown in specified language"""
+    def render_markdown_mixed(self) -> str:
+        """Render all segments with language tags"""
         lines = []
         for line in self.jsonl_path.read_text(encoding="utf-8").splitlines():
             obj = json.loads(line)
             t0 = obj["t0"]
-
-            # Choose text based on language
-            if lang == "zh" and "text_zh" in obj and obj["text_zh"]:
-                text = obj["text_zh"].strip()
-            else:
-                text = obj["text"].strip()
-
+            text = obj["text"].strip()
+            lang = obj.get("detected_language", "??").upper()
             mmss = f"{int(t0//60):02d}:{int(t0%60):02d}"
-            lines.append(f"- **{mmss}** {text}")
+            lines.append(f"- **{mmss}** [{lang}] {text}")
 
-        title = "# 会议记录\n\n" if lang == "zh" else "# Transcript\n\n"
-        md = title + "\n".join(lines) + "\n"
-
-        # Save to appropriate file
-        md_file = self.run_dir / f"transcript-{lang}.md"
+        md = "# Full Transcript (Mixed Languages)\n\n" + "\n".join(lines) + "\n"
+        md_file = self.run_dir / "transcript-mixed.md"
         md_file.write_text(md, encoding="utf-8")
         return md
 
@@ -317,28 +336,6 @@ def doubao_chat(messages: List[Dict[str, str]], model: str, timeout: int = 90) -
         raise RuntimeError(error_msg) from e
 
 
-async def translate_to_chinese_async(text: str, model: str) -> str:
-    """Translate English text to Chinese using Doubao LLM"""
-    try:
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a professional translator. Translate the following text to Simplified Chinese. Return ONLY the translation, no explanations or additional text."
-            },
-            {"role": "user", "content": text}
-        ]
-        # Use asyncio to run synchronous doubao_chat in executor
-        loop = asyncio.get_event_loop()
-        translation = await loop.run_in_executor(
-            None,
-            lambda: doubao_chat(messages, model=model, timeout=30)
-        )
-        return translation.strip()
-    except Exception as e:
-        print(f"[TRANSLATE] Warning: Translation failed: {e}")
-        return text  # Fallback to original text
-
-
 def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     # 简单按字符切；更精细可按段落/句子
     text = text.strip()
@@ -356,14 +353,35 @@ def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
         start = cut
     return [c for c in chunks if c]
 
+def analyze_language_distribution(jsonl_path: Path) -> Dict[str, float]:
+    """Calculate percentage of each language in transcript"""
+    lang_durations = {}
+    total_duration = 0.0
+
+    for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+        obj = json.loads(line)
+        lang = obj.get("detected_language", "unknown")
+        duration = obj["t1"] - obj["t0"]
+        lang_durations[lang] = lang_durations.get(lang, 0.0) + duration
+        total_duration += duration
+
+    if total_duration == 0:
+        return {}
+
+    return {
+        lang: duration / total_duration
+        for lang, duration in lang_durations.items()
+    }
+
+
 def summarize_transcript(transcript_md: str, model: str, lang: str = "en") -> str:
     """Generate meeting summary in specified language"""
     chunks = chunk_text(transcript_md, max_chars=12000)
 
     # Language-specific system prompts and instructions
     if lang == "zh":
-        system_prompt = "你是一个专业的会议纪要撰写助手。请用简体中文撰写简洁、可操作的会议纪要。"
-        summary_instruction = """请总结这段会议记录（第{}/{}段）。
+        system_prompt = "你是一个专业的会议纪要撰写助手。请用简体中文撰写简洁、可操作的会议纪要。输入可能包含多种语言，请理解所有内容并用中文总结。"
+        summary_instruction = """请总结这段会议记录（第{}/{}段）。会议记录可能包含多种语言（标注为[EN]、[ZH]等），请理解所有语言的内容。
 
 使用Markdown格式返回：
 - 关键要点（项目符号列表）
@@ -386,8 +404,8 @@ def summarize_transcript(transcript_md: str, model: str, lang: str = "en") -> st
 {}
 """
     else:  # English
-        system_prompt = "You write concise, actionable meeting minutes in English."
-        summary_instruction = """Summarize this meeting transcript chunk ({}/{}).
+        system_prompt = "You write concise, actionable meeting minutes in English. The input may contain multiple languages - understand all content and summarize in English."
+        summary_instruction = """Summarize this meeting transcript chunk ({}/{}). The transcript may contain multiple languages (marked as [EN], [ZH], etc.) - understand all content.
 
 Return Markdown with:
 - Key points (bullets)
@@ -582,9 +600,15 @@ async def run_capture(
     out_root: Path,
     doubao_model: str,
     save_wav: bool,
+    vad_filter: bool,
+    input_gain: float,
+    language: str,
+    beam_size: int,
+    min_rms: float,
+    verbose_levels: bool = False,
     no_summary: bool = False,
-    caption_lang: str = "en",
     stop_event: asyncio.Event = None,
+    force_exit_event: asyncio.Event = None,
 ):
     run_dir = make_run_dir(out_root)
     started_at = datetime.now().isoformat(timespec="seconds")
@@ -601,12 +625,18 @@ async def run_capture(
         "step_s": step_s,
         "ws_port": ws_port,
         "doubao_model": doubao_model,
-        "caption_lang": caption_lang,
+        "vad_filter": bool(vad_filter),
+        "input_gain": float(input_gain),
+        "language": str(language),
+        "beam_size": int(beam_size),
+        "min_rms": float(min_rms),
+        "verbose_levels": bool(verbose_levels),
+        "auto_detect_language": bool(language == "auto"),
     }
     write_json(run_dir / "meta.json", meta)
 
-    # Ring buffer holds last window + some slack
-    capacity = int(sr * max(window_s * 2, 20))
+    # Keep a larger backfill window so slow model startup still preserves useful audio.
+    capacity = int(sr * max(window_s * 2, 120))
     ring = RingBuffer(capacity_samples=capacity, channels=channels)
 
     # Optional raw wav capture (for debug)
@@ -656,23 +686,62 @@ async def run_capture(
         lambda: WhisperModel(whisper_model_name, device="cpu", compute_type=compute_type)
     )
 
-    print("\n[READY] Press Ctrl+C to stop.\n")
+    print("\n[READY] Press Ctrl+C to stop gracefully; press again within 1.5s to force exit.\n")
 
     try:
         with stream:
             # Wait for model to load (with progress updates)
             model = None
             model_loaded = False
+            did_backfill_pass = False
+            low_rms_streak = 0
+            transcribe_param_names = set()
 
             try:
-                while not (stop_event and stop_event.is_set()):
-                    await asyncio.sleep(step_s)
+                while True:
+                    if force_exit_event is not None:
+                        try:
+                            await asyncio.wait_for(force_exit_event.wait(), timeout=step_s)
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(step_s)
+                    stop_requested = bool(stop_event and stop_event.is_set())
+                    force_exit_requested = bool(force_exit_event and force_exit_event.is_set())
+
+                    if force_exit_requested:
+                        print("[FORCE] Fast shutdown requested; skipping final transcription passes.")
+                        break
 
                     # Check if model is ready (non-blocking)
                     if not model_loaded:
                         if model_future.done():
                             model = await model_future
                             print(f"[MODEL] Whisper model loaded and ready")
+                            try:
+                                transcribe_param_names = set(inspect.signature(model.transcribe).parameters.keys())
+                            except Exception:
+                                transcribe_param_names = set()
+                            model_loaded = True
+                        elif stop_requested:
+                            buffered_s = ring.seconds_written(sr)
+                            if buffered_s < 2.0:
+                                print("[STOP] Not enough buffered audio to transcribe before model load.")
+                                break
+                            print("[MODEL] Stop requested while model is loading; waiting to transcribe buffered audio...")
+                            while not model_future.done():
+                                if force_exit_event and force_exit_event.is_set():
+                                    print("[FORCE] Fast shutdown requested while model is loading; skipping buffered transcription.")
+                                    break
+                                await asyncio.sleep(0.1)
+                            if force_exit_event and force_exit_event.is_set():
+                                break
+                            model = await model_future
+                            print(f"[MODEL] Whisper model loaded and ready")
+                            try:
+                                transcribe_param_names = set(inspect.signature(model.transcribe).parameters.keys())
+                            except Exception:
+                                transcribe_param_names = set()
                             model_loaded = True
                         else:
                             # Still loading, show buffering status
@@ -680,31 +749,80 @@ async def run_capture(
                             print(f"[MODEL] Loading... (buffered {buffered_s:.1f}s of audio)")
                             continue
 
-                    audio = ring.get_last(int(sr * window_s))  # (n, ch)
-                    if audio.shape[0] < int(sr * min(2.0, window_s)):
-                        continue
+                    min_samples = int(sr * min(2.0, window_s))
+                    if not did_backfill_pass:
+                        # First pass after model load: transcribe all buffered audio we still have.
+                        available = ring.available_samples()
+                        audio = ring.get_last(available)
+                        if audio.shape[0] < min_samples:
+                            if stop_requested:
+                                print("[STOP] Final pass skipped: insufficient buffered audio.")
+                                break
+                            continue
+                        t_end = ring.seconds_written(sr)
+                        t_start = max(0.0, t_end - (audio.shape[0] / float(sr)))
+                        print(f"[TRANSCRIBE] Backfilling {audio.shape[0] / float(sr):.1f}s buffered audio")
+                        did_backfill_pass = True
+                    else:
+                        audio = ring.get_last(int(sr * window_s))  # (n, ch)
+                        if audio.shape[0] < min_samples:
+                            if stop_requested:
+                                print("[STOP] Final pass skipped: insufficient audio window.")
+                                break
+                            continue
+                        t_end = ring.seconds_written(sr)
+                        t_start = max(0.0, t_end - window_s)
 
-                    # downmix to mono
-                    mono = np.mean(audio, axis=1).astype(np.float32)
+                    # Downmix by selecting the strongest channel to avoid cancellation.
+                    mono, selected_ch, ch_rms = to_mono_best_channel(audio)
+                    if input_gain != 1.0:
+                        mono = np.clip(mono * float(input_gain), -1.0, 1.0).astype(np.float32)
 
-                    # output rms to debug
+                    # Optional RMS diagnostics for audio troubleshooting.
                     rms = float(np.sqrt(np.mean(mono * mono)))
-                    print(f"[LEVEL] rms={rms:.6f}")
+                    if verbose_levels:
+                        if channels > 1:
+                            ch_rms_text = ",".join(f"{v:.6f}" for v in ch_rms.tolist())
+                            print(f"[LEVEL] rms={rms:.6f} | ch={selected_ch} | ch_rms=[{ch_rms_text}]")
+                        else:
+                            print(f"[LEVEL] rms={rms:.6f}")
 
-                    # compute window absolute start/end in "recording time"
-                    t_end = ring.seconds_written(sr)
-                    t_start = max(0.0, t_end - window_s)
+                    if rms < 0.001:
+                        low_rms_streak += 1
+                        if low_rms_streak % 10 == 0:
+                            print("[AUDIO] Input level is very low. Check meeting audio routing or try --input-gain 4")
+                    else:
+                        low_rms_streak = 0
+
+                    if rms < float(min_rms):
+                        print(f"[GATE] Skip transcription (rms {rms:.6f} < min-rms {float(min_rms):.6f})")
+                        await broadcaster.queue.put({"type": "tick", "t": time.time()})
+                        if stop_requested:
+                            print("[STOP] Final transcription pass complete.")
+                            break
+                        continue
 
                     # transcribe
                     mono_for_whisper = resample_audio(mono, sr_in=sr, sr_out=16000)
 
-                    segments, info = model.transcribe(
-                        mono_for_whisper,
-                        language="en",
-                        vad_filter=True,
-                        beam_size=2,
-                        word_timestamps=False,
-                    )
+                    transcribe_kwargs: Dict[str, Any] = {
+                        "language": None if language == "auto" else language,
+                        "vad_filter": vad_filter,
+                        "beam_size": beam_size,
+                        "word_timestamps": False,
+                    }
+                    if "condition_on_previous_text" in transcribe_param_names:
+                        transcribe_kwargs["condition_on_previous_text"] = False
+                    if "temperature" in transcribe_param_names:
+                        transcribe_kwargs["temperature"] = 0.0
+                    if "no_speech_threshold" in transcribe_param_names:
+                        transcribe_kwargs["no_speech_threshold"] = 0.6
+
+                    segments, info = model.transcribe(mono_for_whisper, **transcribe_kwargs)
+
+                    # Capture detected language from info
+                    detected_lang = info.language if hasattr(info, 'language') else None
+                    lang_confidence = info.language_probability if hasattr(info, 'language_probability') else None
 
                     new_count = 0
                     for seg in segments:
@@ -720,17 +838,15 @@ async def run_capture(
 
                         last_emitted_t1 = max(last_emitted_t1, abs_t1)
 
-                        # Create segment record
+                        # Create segment record with detected language
                         rec = SegmentRec(
                             t0=abs_t0,
                             t1=abs_t1,
                             text=text,
                             avg_logprob=getattr(seg, "avg_logprob", None),
+                            detected_language=detected_lang,
+                            language_confidence=lang_confidence,
                         )
-
-                        # Translate to Chinese if needed
-                        if caption_lang == "zh":
-                            rec.text_zh = await translate_to_chinese_async(rec.text, doubao_model)
 
                         # Save to JSONL
                         tw.append(rec)
@@ -741,25 +857,35 @@ async def run_capture(
                             "t0": rec.t0,
                             "t1": rec.t1,
                             "text": rec.text,
-                            "text_zh": rec.text_zh,
-                            "display_lang": caption_lang
+                            "detected_language": rec.detected_language,
+                            "language_confidence": rec.language_confidence,
                         })
 
-                        # Console output - show language based on setting
+                        # Console output with language tag
                         mmss = f"{int(rec.t0//60):02d}:{int(rec.t0%60):02d}"
-                        display_text = rec.text_zh if (caption_lang == "zh" and rec.text_zh) else rec.text
-                        print(f"[{mmss}] {display_text}")
+                        lang_tag = f"[{rec.detected_language.upper()}]" if rec.detected_language else ""
+                        print(f"[{mmss}]{lang_tag} {rec.text}")
                         new_count += 1
 
                     if new_count == 0:
                         # keepalive for UI if you want
                         await broadcaster.queue.put({"type": "tick", "t": time.time()})
 
+                    if stop_requested:
+                        print("[STOP] Final transcription pass complete.")
+                        break
+
             except Exception as e:
                 print(f"\n[ERROR] {e}")
                 import traceback
                 traceback.print_exc()
     finally:
+        def is_force_exit_requested() -> bool:
+            return bool(force_exit_event and force_exit_event.is_set())
+
+        if is_force_exit_requested():
+            print("[FORCE] Entering fast shutdown cleanup path...")
+
         print("[CLEANUP] Starting cleanup...")
         # Shutdown WS
         try:
@@ -785,6 +911,15 @@ async def run_capture(
         tw.close()
         print("[CLEANUP] Transcript writer closed")
 
+        # Always write a mixed transcript markdown unless rendering fails.
+        transcript_mixed = ""
+        try:
+            print("[TRANSCRIPT] Rendering mixed transcript...")
+            transcript_mixed = tw.render_markdown_mixed()
+            print("[TRANSCRIPT] Mixed transcript saved")
+        except Exception as e:
+            print(f"[TRANSCRIPT] Failed to render mixed transcript: {e}")
+
         # Save wav if enabled
         if save_wav:
             if wav_frames:
@@ -798,18 +933,21 @@ async def run_capture(
             else:
                 print("[WAV] Warning: --save-wav enabled but no audio frames were captured")
 
-        # Render transcripts
-        print("[TRANSCRIPT] Rendering markdown...")
-        transcript_en = tw.render_markdown(lang="en")
+        if is_force_exit_requested():
+            print("[FORCE] Fast shutdown: skipping language analysis, summary, and HTML report generation.")
+            if transcript_mixed:
+                print(f"[DONE] Mixed transcript: {run_dir / 'transcript-mixed.md'}")
+            print(f"[DONE] Partial results saved to: {run_dir}")
+            return
 
-        # Generate Chinese transcript only if translations exist
-        transcript_zh = None
-        if caption_lang == "zh":
-            transcript_zh = tw.render_markdown(lang="zh")
+        # Analyze language distribution
+        print("[TRANSCRIPT] Analyzing language distribution...")
+        lang_stats = analyze_language_distribution(run_dir / "transcript.jsonl")
 
-        print("[TRANSCRIPT] Transcript files saved")
+        if lang_stats:
+            print(f"[TRANSCRIPT] Language distribution: {', '.join(f'{k}: {v*100:.1f}%' for k, v in lang_stats.items())}")
 
-        # Generate summaries in both languages (unless --no-summary)
+        # Generate summaries from mixed transcript (unless --no-summary)
         summary_en = ""
         summary_zh = ""
 
@@ -818,14 +956,28 @@ async def run_capture(
             summary_en = "# Summary\n\n*Summary generation skipped.*\n"
             summary_zh = "# 总结\n\n*已跳过总结生成。*\n"
         else:
+            if is_force_exit_requested():
+                print("[FORCE] Fast shutdown requested during cleanup. Skipping summary/report generation.")
+                if transcript_mixed:
+                    print(f"[DONE] Mixed transcript: {run_dir / 'transcript-mixed.md'}")
+                print(f"[DONE] Partial results saved to: {run_dir}")
+                return
             try:
-                print("[SUM] Generating English summary...")
-                summary_en = summarize_transcript(transcript_en, model=doubao_model, lang="en")
+                # Use mixed transcript as input (contains all content with language tags)
+                print("[SUM] Generating English summary from mixed transcript...")
+                summary_en = summarize_transcript(transcript_mixed, model=doubao_model, lang="en")
                 (run_dir / "summary-en.md").write_text(summary_en, encoding="utf-8")
                 print("[SUM] English summary saved")
 
-                print("[SUM] Generating Chinese summary...")
-                summary_zh = summarize_transcript(transcript_en, model=doubao_model, lang="zh")
+                if is_force_exit_requested():
+                    print("[FORCE] Fast shutdown requested during summary generation. Skipping remaining summary/report steps.")
+                    if transcript_mixed:
+                        print(f"[DONE] Mixed transcript: {run_dir / 'transcript-mixed.md'}")
+                    print(f"[DONE] Partial results saved to: {run_dir}")
+                    return
+
+                print("[SUM] Generating Chinese summary from mixed transcript...")
+                summary_zh = summarize_transcript(transcript_mixed, model=doubao_model, lang="zh")
                 (run_dir / "summary-zh.md").write_text(summary_zh, encoding="utf-8")
                 print("[SUM] Chinese summary saved")
             except Exception as e:
@@ -835,14 +987,22 @@ async def run_capture(
                 (run_dir / "summary-en.md").write_text(f"Error: {e}\n", encoding="utf-8")
                 (run_dir / "summary-zh.md").write_text(f"Error: {e}\n", encoding="utf-8")
 
-        # Build HTML reports
+        if is_force_exit_requested():
+            print("[FORCE] Fast shutdown requested before report generation. Skipping HTML report generation.")
+            if transcript_mixed:
+                print(f"[DONE] Mixed transcript: {run_dir / 'transcript-mixed.md'}")
+            print(f"[DONE] Partial results saved to: {run_dir}")
+            return
+
+        # Build HTML reports using mixed transcript for both languages
         try:
             print("[REPORT] Building HTML reports...")
-            report_en = build_report(run_dir, meta, summary_en, transcript_en, lang="en")
-            report_zh = build_report(run_dir, meta, summary_zh, transcript_zh or transcript_en, lang="zh")
+            report_en = build_report(run_dir, meta, summary_en, transcript_mixed, lang="en")
+            report_zh = build_report(run_dir, meta, summary_zh, transcript_mixed, lang="zh")
             print(f"[DONE] English report: {report_en}")
             print(f"[DONE] Chinese report: {report_zh}")
-            print("Tip: open them with:")
+            print(f"[DONE] Mixed transcript: {run_dir / 'transcript-mixed.md'}")
+            print("Tip: open reports with:")
             print(f"open '{report_en}'")
             print(f"open '{report_zh}'")
         except Exception as e:
@@ -856,10 +1016,10 @@ def main():
     p.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
     p.add_argument("--sr", type=int, default=0, help="Capture sample rate. 0 = use device default")
     p.add_argument("--channels", type=int, default=2, help="BlackHole usually 2ch")
-    p.add_argument("--whisper-model", type=str, default="base", help="Whisper model: tiny, base, small, medium, large (default: base for faster startup)")
+    p.add_argument("--whisper-model", type=str, default="medium", help="Whisper model: tiny, base, small, medium, large (default: medium)")
     p.add_argument("--compute-type", type=str, default="int8", help="M1 Pro CPU recommended: int8")
-    p.add_argument("--window-s", type=float, default=8.0)
-    p.add_argument("--step-s", type=float, default=1.0)
+    p.add_argument("--window-s", type=float, default=2.0, help="transcription window size in seconds (smaller = lower latency)")
+    p.add_argument("--step-s", type=float, default=1.0, help="decode interval in seconds (smaller = more realtime)")
     p.add_argument("--ws-port", type=int, default=8765)
     p.add_argument(
         "--out-root",
@@ -868,14 +1028,14 @@ def main():
     )
     p.add_argument("--doubao-model", type=str, default=DEFAULT_DOUBAO_MODEL)
     p.add_argument("--no-summary", action="store_true", help="skip LLM summary generation")
-    p.add_argument("--save-wav", action="store_true", help="save audio.wav for debugging")
-    p.add_argument(
-        "--caption-lang",
-        type=str,
-        choices=["en", "zh"],
-        default="en",
-        help="Caption display language: en=English (default), zh=Chinese (translates in real-time)"
-    )
+    p.add_argument("--no-vad", action="store_true", help="disable Whisper VAD filtering (useful for very low-volume audio)")
+    p.add_argument("--input-gain", type=float, default=1.0, help="linear gain before Whisper (e.g. 2.0 or 4.0 for quiet virtual devices)")
+    p.add_argument("--language", type=str, default="en", help="whisper language: auto, en (default), zh, etc.")
+    p.add_argument("--beam-size", type=int, default=1, help="decoder beam size (1 is fastest)")
+    p.add_argument("--min-rms", type=float, default=0.01, help="skip decode when input RMS is below threshold")
+    p.add_argument("--verbose-levels", action="store_true", help="print per-window [LEVEL] RMS diagnostics")
+    p.add_argument("--save-wav", dest="save_wav", action="store_true", default=True, help="save audio.wav for debugging (default: enabled)")
+    p.add_argument("--no-save-wav", dest="save_wav", action="store_false", help="disable saving audio.wav")
     args = p.parse_args()
 
     if args.list_devices:
@@ -888,7 +1048,17 @@ def main():
     print("="*60)
     print(f"\n[CONFIG] Whisper model: {args.whisper_model}")
     print(f"[CONFIG] Doubao model: {args.doubao_model}")
-    print(f"[CONFIG] Caption language: {args.caption_lang}")
+    if args.language == "auto":
+        print(f"[CONFIG] Language detection: Auto (supports English, Chinese, and more)")
+    else:
+        print(f"[CONFIG] Language detection: Fixed ({args.language})")
+    print(f"[CONFIG] VAD filter: {'disabled' if args.no_vad else 'enabled'}")
+    print(f"[CONFIG] Input gain: {args.input_gain}x")
+    print(f"[CONFIG] Whisper language: {args.language}")
+    print(f"[CONFIG] Beam size: {args.beam_size}")
+    print(f"[CONFIG] Min RMS gate: {args.min_rms}")
+    print(f"[CONFIG] Window/step: {args.window_s}s / {args.step_s}s")
+    print(f"[CONFIG] RMS logs: {'enabled' if args.verbose_levels else 'disabled'}")
     print(f"[CONFIG] Summary: {'disabled' if args.no_summary else 'enabled'}")
 
     print("\n[INIT] Resolving audio device...")
@@ -909,11 +1079,25 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Event to signal shutdown
+    # Events to signal shutdown mode
     stop_event = asyncio.Event()
+    force_exit_event = asyncio.Event()
+    double_sigint_window_s = 1.5
+    last_sigint_ts = 0.0
 
     def signal_handler(sig, frame):
-        print("\n[STOP] Stopping...")
+        nonlocal last_sigint_ts
+        now = time.monotonic()
+        is_second_sigint = stop_event.is_set() and (now - last_sigint_ts) <= double_sigint_window_s
+        last_sigint_ts = now
+
+        if is_second_sigint:
+            print(f"\n[FORCE] Second Ctrl+C within {double_sigint_window_s:.1f}s. Fast shutdown requested.")
+            force_exit_event.set()
+            stop_event.set()
+            return
+
+        print(f"\n[STOP] Graceful stop requested. Press Ctrl+C again within {double_sigint_window_s:.1f}s to force exit.")
         stop_event.set()
 
     # Register signal handler
@@ -934,9 +1118,15 @@ def main():
                 out_root=out_root,
                 doubao_model=args.doubao_model,
                 save_wav=args.save_wav,
+                vad_filter=not args.no_vad,
+                input_gain=args.input_gain,
+                language=args.language,
+                beam_size=args.beam_size,
+                min_rms=args.min_rms,
+                verbose_levels=args.verbose_levels,
                 no_summary=args.no_summary,
-                caption_lang=args.caption_lang,
                 stop_event=stop_event,
+                force_exit_event=force_exit_event,
             )
         )
     finally:
